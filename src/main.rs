@@ -20,7 +20,6 @@ const V0: f32 = 0.0000001; // init particle vel
 
 const WGS: u32 = 256; // work group size for compute shaders
 
-
 // ---------- data ----------
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -31,6 +30,14 @@ struct Particle {
     prefix: u32,
     pad: [u32; 2], // padding for 16B alignment 32 + 16 = 48
 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct MortonPair {
+    code: u32,
+    idx: u32,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Params {
@@ -41,6 +48,8 @@ struct Params {
     force_strength: f32,
     particle_damping: f32,
     dt: f32,
+    level: u32,
+    _pad: u32,
 }
 
 // ---------- model ----------
@@ -49,6 +58,7 @@ struct Pipelines {
     clear_counts: wgpu::ComputePipeline,
     build_grid: wgpu::ComputePipeline,
     interact: wgpu::ComputePipeline,
+    morton: wgpu::ComputePipeline,
 }
 
 struct Buffers {
@@ -57,15 +67,18 @@ struct Buffers {
     grid_counts: wgpu::Buffer,
     grid_indices: wgpu::Buffer,
     params: wgpu::Buffer,
+    morton_buffer: wgpu::Buffer,
 }
 
 struct BindGroups {
-    clear_counts: wgpu::BindGroup,
-    build_a: wgpu::BindGroup,
-    build_b: wgpu::BindGroup,
-    interact_a2b: wgpu::BindGroup,
-    interact_b2a: wgpu::BindGroup,
-    params: wgpu::BindGroup,
+    clear_counts_bg: wgpu::BindGroup,
+    build_a_bg: wgpu::BindGroup,
+    build_b_bg: wgpu::BindGroup,
+    interact_a2b_bg: wgpu::BindGroup,
+    interact_b2a_bg: wgpu::BindGroup,
+    params_bg: wgpu::BindGroup,
+    morton_a_bg: wgpu::BindGroup,
+    morton_b_bg: wgpu::BindGroup,
 }
 
 struct Model {
@@ -103,6 +116,9 @@ fn model(app: &App) -> Model {
             pad: [0, 0],
         });
     }
+
+    let morton_init = vec![MortonPair { code: 0, idx: 0 }; N_PARTICLES];
+
     let a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("particles A"),
         contents: bytemuck::cast_slice(&init),
@@ -126,6 +142,13 @@ fn model(app: &App) -> Model {
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
 
+    // --- morton code
+    let morton_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("morton buffer"),
+        contents: bytemuck::cast_slice(&morton_init),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+
     // --- params
     let params_init = Params {
         mouse: [0.0, 0.0],
@@ -135,6 +158,8 @@ fn model(app: &App) -> Model {
         force_strength: FORCE_STRENGTH,
         dt: DT,
         particle_damping: PARTICLE_DAMPING,
+        level: 0,
+        _pad: 0,
     };
     let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("params"),
@@ -144,8 +169,8 @@ fn model(app: &App) -> Model {
 
     // --- shaders
     let vs = shader(&device, "vs", shaders::vs());
-    let fs = shader(&device, "fs", shaders::fs());
-    let cs_clear = shader(&device, "cs_clear", shaders::cs_clear(GRID_SIZE));
+    let fs = shader(&device, "fs", shaders::fs(GRID_SIZE));
+    let cs_clear: wgpu::ShaderModule = shader(&device, "cs_clear", shaders::cs_clear(GRID_SIZE));
     let cs_build = shader(
         &device,
         "cs_build",
@@ -156,6 +181,7 @@ fn model(app: &App) -> Model {
         "cs_interact",
         shaders::cs_interact(GRID_SIZE, MAX_PER_CELL),
     );
+    let cs_morton = shader(&device, "cs_morton", shaders::cs_morton_code());
 
     // --- layouts
     let clear_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -174,12 +200,16 @@ fn model(app: &App) -> Model {
         label: Some("interact bgl"),
         entries: &[storage_ro(0), storage_rw(1), storage_ro(2), storage_ro(3)],
     });
+    let morton_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("morton bgl"),
+        entries: &[storage_ro(0), storage_rw(1)],
+    });
 
     // --- pipelines
     let render = {
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("render layout"),
-            bind_group_layouts: &[],
+            bind_group_layouts: &[&params_bgl],
             push_constant_ranges: &[],
         });
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -248,13 +278,27 @@ fn model(app: &App) -> Model {
         })
     };
 
+    let morton = {
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("morton layout"),
+            bind_group_layouts: &[&morton_bgl],
+            push_constant_ranges: &[],
+        });
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("morton pipeline"),
+            layout: Some(&pl),
+            module: &cs_morton,
+            entry_point: "morton_main",
+        })
+    };
+
     // --- bind groups
     let clear_counts_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("clear bg"),
         layout: &clear_bgl,
         entries: &[bind_ent(0, &grid_counts)],
     });
-    let build_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let build_a_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("build A"),
         layout: &build_bgl,
         entries: &[
@@ -263,7 +307,7 @@ fn model(app: &App) -> Model {
             bind_ent(2, &grid_indices),
         ],
     });
-    let build_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let build_b_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("build B"),
         layout: &build_bgl,
         entries: &[
@@ -272,7 +316,7 @@ fn model(app: &App) -> Model {
             bind_ent(2, &grid_indices),
         ],
     });
-    let interact_a2b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let interact_a2b_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("interact A->B"),
         layout: &interact_bgl,
         entries: &[
@@ -282,7 +326,7 @@ fn model(app: &App) -> Model {
             bind_ent(3, &grid_indices),
         ],
     });
-    let interact_b2a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let interact_b2a_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("interact B->A"),
         layout: &interact_bgl,
         entries: &[
@@ -297,6 +341,16 @@ fn model(app: &App) -> Model {
         layout: &params_bgl,
         entries: &[bind_ent(0, &params)],
     });
+    let morton_a_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("morton a bg"),
+        layout: &morton_bgl,
+        entries: &[bind_ent(0, &a), bind_ent(1, &morton_buffer)],
+    });
+    let morton_b_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("morton b bg"),
+        layout: &morton_bgl,
+        entries: &[bind_ent(0, &b), bind_ent(1, &morton_buffer)],
+    });
 
     Model {
         pipes: Pipelines {
@@ -304,6 +358,7 @@ fn model(app: &App) -> Model {
             clear_counts,
             build_grid,
             interact,
+            morton,
         },
         bufs: Buffers {
             a,
@@ -311,14 +366,17 @@ fn model(app: &App) -> Model {
             grid_counts,
             grid_indices,
             params,
+            morton_buffer,
         },
         bgs: BindGroups {
-            clear_counts: clear_counts_bg,
-            build_a,
-            build_b,
-            interact_a2b,
-            interact_b2a,
-            params: params_bg,
+            clear_counts_bg,
+            build_a_bg,
+            build_b_bg,
+            interact_a2b_bg,
+            interact_b2a_bg,
+            params_bg,
+            morton_a_bg,
+            morton_b_bg,
         },
         src_is_a: true,
     }
@@ -344,6 +402,8 @@ fn update(app: &App, m: &mut Model, _u: Update) {
         force_strength: FORCE_STRENGTH,
         dt: DT,
         particle_damping: PARTICLE_DAMPING,
+        level: 0,
+        _pad: 0,
     };
     let window = app.main_window();
     let q = window.queue();
@@ -361,10 +421,20 @@ fn view(app: &App, m: &Model, frame: Frame) {
     let mut enc = frame.command_encoder();
 
     // select ping-pong route once
-    let (build_bg, interact_bg, render_buf) = if m.src_is_a {
-        (&m.bgs.build_a, &m.bgs.interact_a2b, &m.bufs.b)
+    let (build_bg, interact_bg, morton_bg, render_buf) = if m.src_is_a {
+        (
+            &m.bgs.build_a_bg,
+            &m.bgs.interact_a2b_bg,
+            &m.bgs.morton_a_bg,
+            &m.bufs.b,
+        )
     } else {
-        (&m.bgs.build_b, &m.bgs.interact_b2a, &m.bufs.a)
+        (
+            &m.bgs.build_b_bg,
+            &m.bgs.interact_b2a_bg,
+            &m.bgs.morton_b_bg,
+            &m.bufs.a,
+        )
     };
 
     // clear counts
@@ -373,7 +443,7 @@ fn view(app: &App, m: &Model, frame: Frame) {
             label: Some("clear_counts"),
         });
         c.set_pipeline(&m.pipes.clear_counts);
-        c.set_bind_group(0, &m.bgs.clear_counts, &[]);
+        c.set_bind_group(0, &m.bgs.clear_counts_bg, &[]);
         c.dispatch_workgroups(div_ceil(NUM_CELLS, WGS), 1, 1);
     }
 
@@ -394,7 +464,17 @@ fn view(app: &App, m: &Model, frame: Frame) {
         });
         c.set_pipeline(&m.pipes.interact);
         c.set_bind_group(0, interact_bg, &[]);
-        c.set_bind_group(1, &m.bgs.params, &[]);
+        c.set_bind_group(1, &m.bgs.params_bg, &[]);
+        c.dispatch_workgroups(div_ceil(N_PARTICLES as u32, WGS), 1, 1);
+    }
+
+    // Compute morton code
+    {
+        let mut c = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("morton"),
+        });
+        c.set_pipeline(&m.pipes.morton);
+        c.set_bind_group(0, morton_bg, &[]);
         c.dispatch_workgroups(div_ceil(N_PARTICLES as u32, WGS), 1, 1);
     }
 
@@ -413,6 +493,7 @@ fn view(app: &App, m: &Model, frame: Frame) {
             depth_stencil_attachment: None,
         });
         r.set_pipeline(&m.pipes.render);
+        r.set_bind_group(0, &m.bgs.params_bg, &[]);
         r.set_vertex_buffer(0, render_buf.slice(..));
         r.draw(0..N_PARTICLES as u32, 0..1);
     }
@@ -426,13 +507,13 @@ fn shader(device: &wgpu::Device, label: &str, src: String) -> wgpu::ShaderModule
     })
 }
 
-const PARTICLE_ATTRS: [wgpu::VertexAttribute; 2] =
-    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
+const PARTICLE_ATTRS: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32, 3 => Uint32];
 fn particle_vbuf_layout() -> wgpu::VertexBufferLayout<'static> {
     return wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Particle>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &PARTICLE_ATTRS, // lives long enough in this scope
+        attributes: &PARTICLE_ATTRS,
     };
 }
 fn div_ceil(n: u32, d: u32) -> u32 {
@@ -465,7 +546,7 @@ fn storage_rw(binding: u32) -> wgpu::BindGroupLayoutEntry {
 fn uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
+        visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Uniform,
             has_dynamic_offset: false,
@@ -488,40 +569,74 @@ mod shaders {
 struct VsOut {
   @builtin(position) pos : vec4<f32>,
   @location(0) vel : vec2<f32>,
+  @location(1) prefix: u32,
 };
 @vertex
-fn vs_main(@location(0) pos: vec2<f32>, @location(1) vel: vec2<f32>) -> VsOut {
+fn vs_main(@location(0) pos: vec2<f32>, @location(1) vel: vec2<f32>, @location(2) _mass: f32, @location(3) prefix: u32) -> VsOut {
   var out: VsOut;
   out.pos = vec4<f32>(pos, 0.0, 1.0);
   out.vel = vel;
+  out.prefix = prefix;
   return out;
 }
 "#
         .into()
     }
 
-    pub fn fs() -> String {
-        r#"
+    pub fn fs(grid: u32) -> String {
+        format!(
+            r#"
+const GRID_SIZE : u32 = {grid}u;
+
+struct Params {{
+  mouse: vec2<f32>,
+  mouse_radius2: f32,
+  mouse_strength: f32,
+  force_radius2: f32,
+  force_strength: f32,
+  particle_damping: f32,
+  dt: f32,
+  level: u32,
+  _pad: u32,
+}};
+
+@group(0) @binding(0) var<uniform> params: Params;
+
 @fragment
-fn fs_main(@location(0) vel: vec2<f32>) -> @location(0) vec4<f32> {
-    let speed = length(vel) * 300.0;
-    let t = clamp(speed, 0.0, 1.0);
-    var r: f32; var g: f32; var b: f32;
-    if (t < 0.2) {
-        r = 0.0; g = 0.0; b = t / 0.2;
-    } else if (t < 0.4) {
-        r = 0.0; g = (t - 0.2) / 0.2; b = 1.0;
-    } else if (t < 0.6) {
-        r = (t - 0.4) / 0.2; g = 1.0; b = 1.0 - (t - 0.4) / 0.2;
-    } else if (t < 0.8) {
-        r = 1.0; g = 1.0 - (t - 0.6) / 0.2; b = 0.0;
-    } else {
-        r = 1.0; g = (t - 0.8) / 0.2; b = (t - 0.8) / 0.2;
-    }
-    return vec4<f32>(r, g, b, 0.8);
-}
-"#
-        .into()
+fn fs_main(@location(0) vel: vec2<f32>, @location(1) prefix: u32) -> @location(0) vec4<f32> {{
+    // quadtree depth from grid size (e.g. 64 -> 6)
+    let depth = u32(log2(f32(GRID_SIZE)));
+    let lvl = min(params.level, depth);
+
+    // top-level quadrant = the highest morton pair (yMSB,xMSB)
+    let top_pair = (prefix >> (2u * depth - 2u)) & 3u;
+
+    if (lvl == 1u) {{
+        // Fixed palette: 4 distinct colors for the 4 top-level quadrants
+        // 0: NE (depending on your morton ordering), 1,2,3 likewise
+        var c: vec3<f32>;
+        switch (top_pair) {{
+            case 0u: {{ c = vec3<f32>(1.0, 0.25, 0.25); }} // red-ish
+            case 1u: {{ c = vec3<f32>(0.25, 1.0, 0.35); }} // green-ish
+            case 2u: {{ c = vec3<f32>(0.30, 0.55, 1.0); }} // blue-ish
+            default: {{ c = vec3<f32>(1.0, 0.95, 0.30); }} // yellow-ish
+        }}
+        return vec4<f32>(c, 1.0);
+    }} else {{
+        // General case: color by cell at requested level
+        let cell_id = prefix >> (2u * (depth - lvl));
+
+        // Simple 32-bit LCG hash to RGB
+        let h = cell_id * 1664525u + 1013904223u;
+        let r = f32((h        ) & 255u) / 255.0;
+        let g = f32((h >>  8u ) & 255u) / 255.0;
+        let b = f32((h >> 16u ) & 255u) / 255.0;
+        return vec4<f32>(r, g, b, 1.0);
+    }}
+}}
+"#,
+            grid = grid
+        )
     }
 
     pub fn cs_clear(grid: u32) -> String {
@@ -554,7 +669,7 @@ struct Particle {{
   vel    : vec2<f32>,
   mass   : f32,
   prefix : u32,
-  pad    : u32,
+  pad    : vec2<u32>,
 }};
 struct Particles {{ data: array<Particle> }};
 struct Counts    {{ data: array<atomic<u32>> }};
@@ -602,7 +717,7 @@ struct Particle {{
   vel    : vec2<f32>,
   mass   : f32,
   prefix : u32,
-  pad    : u32,
+  pad    : vec2<u32>,
 }};
 struct Particles {{ data: array<Particle> }};
 struct Counts    {{ data: array<atomic<u32>> }};
@@ -616,6 +731,8 @@ struct Params {{
   force_strength : f32,
   particle_damping : f32,
   dt: f32,
+  level: u32,
+  _pad: u32,
 }};
 
 @group(0) @binding(0) var<storage, read>       in_particles  : Particles;
@@ -634,6 +751,20 @@ fn grid_coord(pos : vec2<f32>) -> vec2<u32> {{
 
 fn cell_index_xy(x: u32, y: u32) -> u32 {{
     return y * GRID_SIZE + x;
+}}
+
+// ---- Morton helpers ----
+fn part1by1(n: u32) -> u32 {{
+    var x = n & 0x0000ffffu;
+    x = (x | (x << 8u)) & 0x00FF00FFu;
+    x = (x | (x << 4u)) & 0x0F0F0F0Fu;
+    x = (x | (x << 2u)) & 0x33333333u;
+    x = (x | (x << 1u)) & 0x55555555u;
+    return x;
+}}
+
+fn morton2D(x: u32, y: u32) -> u32 {{
+    return (part1by1(y) << 1u) | part1by1(x);
 }}
 
 @compute @workgroup_size(256)
@@ -684,9 +815,77 @@ fn interact_main(@builtin(global_invocation_id) id : vec3<u32>) {{
 
     out_particles.data[i].pos = pos;
     out_particles.data[i].vel = vel;
+
+    // Morton Code Computation for next iteration
+    let gx_max = GRID_SIZE - 1u;
+    let gy_max = GRID_SIZE - 1u;
+    let gx = clamp(u32(((pos.x + 1.0) * 0.5) * f32(GRID_SIZE)), 0u, gx_max);
+    let gy = clamp(u32(((pos.y + 1.0) * 0.5) * f32(GRID_SIZE)), 0u, gy_max);
+    out_particles.data[i].prefix = morton2D(gx, gy);
 }}
 "#,
             mpc = max_per_cell
+        )
+    }
+
+    pub fn cs_morton_code() -> String {
+        format!(
+            r#"
+        const GRID_SIZE : u32 = 1024u;   // adjust to your grid resolution
+
+        struct Particle {{
+        pos    : vec2<f32>,
+        vel    : vec2<f32>,
+        mass   : f32,
+        prefix : u32,
+        pad    : vec2<u32>,
+        }};
+
+        struct Particles {{ data: array<Particle> }};
+
+        struct Morton {{
+        code : u32,
+        idx  : u32,
+        }};
+
+        struct MortonBuf {{ data: array<Morton> }};
+
+        @group(0) @binding(0) var<storage, read>  particles : Particles;
+        @group(0) @binding(1) var<storage, write> morton_out : MortonBuf;
+
+        // ---- Morton helpers ----
+        fn part1by1(n: u32) -> u32 {{
+            var x = n & 0x0000ffffu;
+            x = (x | (x << 8u)) & 0x00FF00FFu;
+            x = (x | (x << 4u)) & 0x0F0F0F0Fu;
+            x = (x | (x << 2u)) & 0x33333333u;
+            x = (x | (x << 1u)) & 0x55555555u;
+            return x;
+        }}
+
+        fn morton2D(x: u32, y: u32) -> u32 {{
+            return (part1by1(y) << 1u) | part1by1(x);
+        }}
+
+        // ---- Main ----
+        @compute @workgroup_size(256)
+        fn morton_main(@builtin(global_invocation_id) gid : vec3<u32>) {{
+            let i = gid.x;
+            if (i >= arrayLength(&particles.data)) {{
+                return;
+            }}
+
+            // map from [-1,1] NDC → [0, GRID_SIZE-1] integer coords
+            let pos = particles.data[i].pos;
+            let gx_max = GRID_SIZE - 1u;
+            let gy_max = GRID_SIZE - 1u;
+            let gx = clamp(u32(((pos.x + 1.0) * 0.5) * f32(GRID_SIZE)), 0u, gx_max);
+            let gy = clamp(u32(((pos.y + 1.0) * 0.5) * f32(GRID_SIZE)), 0u, gy_max);
+            let code = morton2D(gx, gy);
+
+            morton_out.data[i].code = code;
+            morton_out.data[i].idx  = i;
+        }}"#,
         )
     }
 }
