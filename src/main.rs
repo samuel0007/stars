@@ -1,58 +1,81 @@
 use bytemuck::{Pod, Zeroable};
+use nannou::Frame;
 use nannou::prelude::*;
 use nannou::wgpu::{self, util::DeviceExt};
-use nannou::Frame;
 
-const N_PARTICLES: usize = 100_000;
+// ---------- constants ----------
+const N_PARTICLES: usize = 10_000;
 const GRID_SIZE: u32 = 64;
 const MAX_PER_CELL: u32 = 64;
 const NUM_CELLS: u32 = GRID_SIZE * GRID_SIZE;
 
+const MOUSE_RADIUS2: f32 = 0.05;
+const MOUSE_STRENGTH: f32 = 0.0005; // 0.0015
+const FORCE_RADIUS2: f32 = 0.002;
+const FORCE_STRENGTH: f32 = 0.000000002;
+const PARTICLE_DAMPING: f32 = 0.99;
+const DT: f32 = 1.;
+
+const V0: f32 = 0.0000001; // init particle vel
+
+const WGS: u32 = 256; // work group size for compute shaders
+
+
+// ---------- data ----------
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Particle {
     pos: [f32; 2],
     vel: [f32; 2],
+    mass: f32,
+    prefix: u32,
+    pad: [u32; 2], // padding for 16B alignment 32 + 16 = 48
 }
-
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Params {
-    mouse: [f32; 2], // NDC
-    radius2: f32,
-    strength: f32,
+    mouse: [f32; 2],
+    mouse_radius2: f32,
+    mouse_strength: f32,
+    force_radius2: f32,
+    force_strength: f32,
+    particle_damping: f32,
+    dt: f32,
+}
+
+// ---------- model ----------
+struct Pipelines {
+    render: wgpu::RenderPipeline,
+    clear_counts: wgpu::ComputePipeline,
+    build_grid: wgpu::ComputePipeline,
+    interact: wgpu::ComputePipeline,
+}
+
+struct Buffers {
+    a: wgpu::Buffer,
+    b: wgpu::Buffer,
+    grid_counts: wgpu::Buffer,
+    grid_indices: wgpu::Buffer,
+    params: wgpu::Buffer,
+}
+
+struct BindGroups {
+    clear_counts: wgpu::BindGroup,
+    build_a: wgpu::BindGroup,
+    build_b: wgpu::BindGroup,
+    interact_a2b: wgpu::BindGroup,
+    interact_b2a: wgpu::BindGroup,
+    params: wgpu::BindGroup,
 }
 
 struct Model {
-    // render
-    render_pipeline: wgpu::RenderPipeline,
-
-    // compute pipelines
-    clear_counts_pipeline: wgpu::ComputePipeline,
-    build_grid_pipeline: wgpu::ComputePipeline,
-    interact_pipeline: wgpu::ComputePipeline,
-
-    // particle ping-pong
-    buf_a: wgpu::Buffer,
-    buf_b: wgpu::Buffer,
-    source_is_a: bool,
-
-    // grid buffers
-    grid_counts: wgpu::Buffer,
-    grid_indices: wgpu::Buffer,
-
-    // bind groups
-    clear_counts_bg: wgpu::BindGroup,
-    build_bg_a: wgpu::BindGroup,
-    build_bg_b: wgpu::BindGroup,
-    interact_bg_a2b: wgpu::BindGroup,
-    interact_bg_b2a: wgpu::BindGroup,
-
-    // mouse params
-    params_buf: wgpu::Buffer,
-    params_bg: wgpu::BindGroup,
+    pipes: Pipelines,
+    bufs: Buffers,
+    bgs: BindGroups,
+    src_is_a: bool,
 }
 
+// ---------- app ----------
 fn main() {
     nannou::app(model).update(update).view(view).run();
 }
@@ -69,60 +92,403 @@ fn model(app: &App) -> Model {
     let window = app.window(win_id).unwrap();
     let device = window.device();
 
-    // particles
-    let mut particles = Vec::with_capacity(N_PARTICLES);
+    // --- particles
+    let mut init = Vec::with_capacity(N_PARTICLES);
     for _ in 0..N_PARTICLES {
-        particles.push(Particle {
-            // pos: [random_range(-1.0, 1.0), random_range(-1.0, 1.0)],
-            pos: [random_range(-0.01, 0.01), random_range(-0.01, 0.01)],
-            vel: [random_range(-0.0001, 0.0001), random_range(-0.0001, 0.0001)],
+        init.push(Particle {
+            pos: [random_range(-1.0, 1.0), random_range(-1.0, 1.0)],
+            vel: [random_range(-V0, V0), random_range(-V0, V0)],
+            mass: random_range(0.5, 5.),
+            prefix: 0,
+            pad: [0, 0],
         });
     }
-
-    let buf_a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("particles A"),
-        contents: bytemuck::cast_slice(&particles),
+        contents: bytemuck::cast_slice(&init),
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
     });
-    let buf_b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("particles B"),
-        contents: bytemuck::cast_slice(&particles),
+        contents: bytemuck::cast_slice(&init),
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
     });
 
-    // grid buffers
-    let zero_counts = vec![0u32; NUM_CELLS as usize];
-    let zero_indices = vec![0u32; (NUM_CELLS * MAX_PER_CELL) as usize];
+    // --- grid
     let grid_counts = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("grid_counts"),
-        contents: bytemuck::cast_slice(&zero_counts),
+        contents: bytemuck::cast_slice(&vec![0u32; NUM_CELLS as usize]),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let grid_indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("grid_indices"),
-        contents: bytemuck::cast_slice(&zero_indices),
+        contents: bytemuck::cast_slice(&vec![0u32; (NUM_CELLS * MAX_PER_CELL) as usize]),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
 
-    // mouse params buffer
-    let initial_params = Params {
+    // --- params
+    let params_init = Params {
         mouse: [0.0, 0.0],
-        radius2: 0.05,     // ~radius 0.223 in NDC
-        strength: 0.0015,  // tweak
+        mouse_radius2: MOUSE_RADIUS2,
+        mouse_strength: MOUSE_STRENGTH,
+        force_radius2: FORCE_RADIUS2,
+        force_strength: FORCE_STRENGTH,
+        dt: DT,
+        particle_damping: PARTICLE_DAMPING,
     };
-    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("params"),
-        contents: bytemuck::bytes_of(&initial_params),
+        contents: bytemuck::bytes_of(&params_init),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
-    // WGSL
-    let vs_src = r#"
+    // --- shaders
+    let vs = shader(&device, "vs", shaders::vs());
+    let fs = shader(&device, "fs", shaders::fs());
+    let cs_clear = shader(&device, "cs_clear", shaders::cs_clear(GRID_SIZE));
+    let cs_build = shader(
+        &device,
+        "cs_build",
+        shaders::cs_build(GRID_SIZE, MAX_PER_CELL),
+    );
+    let cs_interact = shader(
+        &device,
+        "cs_interact",
+        shaders::cs_interact(GRID_SIZE, MAX_PER_CELL),
+    );
+
+    // --- layouts
+    let clear_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("clear bgl"),
+        entries: &[storage_rw(0)],
+    });
+    let build_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("build bgl"),
+        entries: &[storage_ro(0), storage_rw(1), storage_rw(2)],
+    });
+    let params_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("params bgl"),
+        entries: &[uniform(0)],
+    });
+    let interact_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("interact bgl"),
+        entries: &[storage_ro(0), storage_rw(1), storage_ro(2), storage_ro(3)],
+    });
+
+    // --- pipelines
+    let render = {
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("render layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("render pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &vs,
+                entry_point: "vs_main",
+                buffers: &[particle_vbuf_layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fs,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: Frame::TEXTURE_FORMAT,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::PointList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        })
+    };
+    let clear_counts = {
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("clear layout"),
+            bind_group_layouts: &[&clear_bgl],
+            push_constant_ranges: &[],
+        });
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("clear pipeline"),
+            layout: Some(&pl),
+            module: &cs_clear,
+            entry_point: "clear_main",
+        })
+    };
+    let build_grid = {
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("build layout"),
+            bind_group_layouts: &[&build_bgl],
+            push_constant_ranges: &[],
+        });
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("build pipeline"),
+            layout: Some(&pl),
+            module: &cs_build,
+            entry_point: "build_main",
+        })
+    };
+    let interact = {
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("interact layout"),
+            bind_group_layouts: &[&interact_bgl, &params_bgl],
+            push_constant_ranges: &[],
+        });
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("interact pipeline"),
+            layout: Some(&pl),
+            module: &cs_interact,
+            entry_point: "interact_main",
+        })
+    };
+
+    // --- bind groups
+    let clear_counts_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("clear bg"),
+        layout: &clear_bgl,
+        entries: &[bind_ent(0, &grid_counts)],
+    });
+    let build_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("build A"),
+        layout: &build_bgl,
+        entries: &[
+            bind_ent(0, &a),
+            bind_ent(1, &grid_counts),
+            bind_ent(2, &grid_indices),
+        ],
+    });
+    let build_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("build B"),
+        layout: &build_bgl,
+        entries: &[
+            bind_ent(0, &b),
+            bind_ent(1, &grid_counts),
+            bind_ent(2, &grid_indices),
+        ],
+    });
+    let interact_a2b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("interact A->B"),
+        layout: &interact_bgl,
+        entries: &[
+            bind_ent(0, &a),
+            bind_ent(1, &b),
+            bind_ent(2, &grid_counts),
+            bind_ent(3, &grid_indices),
+        ],
+    });
+    let interact_b2a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("interact B->A"),
+        layout: &interact_bgl,
+        entries: &[
+            bind_ent(0, &b),
+            bind_ent(1, &a),
+            bind_ent(2, &grid_counts),
+            bind_ent(3, &grid_indices),
+        ],
+    });
+    let params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("params bg"),
+        layout: &params_bgl,
+        entries: &[bind_ent(0, &params)],
+    });
+
+    Model {
+        pipes: Pipelines {
+            render,
+            clear_counts,
+            build_grid,
+            interact,
+        },
+        bufs: Buffers {
+            a,
+            b,
+            grid_counts,
+            grid_indices,
+            params,
+        },
+        bgs: BindGroups {
+            clear_counts: clear_counts_bg,
+            build_a,
+            build_b,
+            interact_a2b,
+            interact_b2a,
+            params: params_bg,
+        },
+        src_is_a: true,
+    }
+}
+
+fn update(app: &App, m: &mut Model, _u: Update) {
+    m.src_is_a = !m.src_is_a;
+
+    // mouse → NDC
+    let win = app.main_window().rect();
+    let mp = app.mouse.position();
+    let ndc = [
+        (mp.x / (win.w() * 0.5)).clamp(-1.0, 1.0) as f32,
+        (mp.y / (win.h() * 0.5)).clamp(-1.0, 1.0) as f32,
+    ];
+
+    // TODO make these interactive params
+    let params = Params {
+        mouse: ndc,
+        mouse_radius2: MOUSE_RADIUS2,
+        mouse_strength: MOUSE_STRENGTH,
+        force_radius2: FORCE_RADIUS2,
+        force_strength: FORCE_STRENGTH,
+        dt: DT,
+        particle_damping: PARTICLE_DAMPING,
+    };
+    let window = app.main_window();
+    let q = window.queue();
+    q.write_buffer(&m.bufs.params, 0, bytemuck::bytes_of(&params));
+}
+
+fn view(app: &App, m: &Model, frame: Frame) {
+    // fade layer
+    let draw = app.draw();
+    draw.rect()
+        .wh(app.window_rect().wh())
+        .rgba(0.0, 0.0, 0.0, 0.03);
+    draw.to_frame(app, &frame).unwrap();
+
+    let mut enc = frame.command_encoder();
+
+    // select ping-pong route once
+    let (build_bg, interact_bg, render_buf) = if m.src_is_a {
+        (&m.bgs.build_a, &m.bgs.interact_a2b, &m.bufs.b)
+    } else {
+        (&m.bgs.build_b, &m.bgs.interact_b2a, &m.bufs.a)
+    };
+
+    // clear counts
+    {
+        let mut c = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("clear_counts"),
+        });
+        c.set_pipeline(&m.pipes.clear_counts);
+        c.set_bind_group(0, &m.bgs.clear_counts, &[]);
+        c.dispatch_workgroups(div_ceil(NUM_CELLS, WGS), 1, 1);
+    }
+
+    // build grid
+    {
+        let mut c = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("build_grid"),
+        });
+        c.set_pipeline(&m.pipes.build_grid);
+        c.set_bind_group(0, build_bg, &[]);
+        c.dispatch_workgroups(div_ceil(N_PARTICLES as u32, WGS), 1, 1);
+    }
+
+    // interact
+    {
+        let mut c = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("interact"),
+        });
+        c.set_pipeline(&m.pipes.interact);
+        c.set_bind_group(0, interact_bg, &[]);
+        c.set_bind_group(1, &m.bgs.params, &[]);
+        c.dispatch_workgroups(div_ceil(N_PARTICLES as u32, WGS), 1, 1);
+    }
+
+    // render
+    {
+        let mut r: wgpu::RenderPass<'_> = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("render"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: frame.texture_view(),
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: true,
+                },
+            })],
+            depth_stencil_attachment: None,
+        });
+        r.set_pipeline(&m.pipes.render);
+        r.set_vertex_buffer(0, render_buf.slice(..));
+        r.draw(0..N_PARTICLES as u32, 0..1);
+    }
+}
+
+// ---------- helpers ----------
+fn shader(device: &wgpu::Device, label: &str, src: String) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    })
+}
+
+const PARTICLE_ATTRS: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
+fn particle_vbuf_layout() -> wgpu::VertexBufferLayout<'static> {
+    return wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<Particle>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &PARTICLE_ATTRS, // lives long enough in this scope
+    };
+}
+fn div_ceil(n: u32, d: u32) -> u32 {
+    (n + d - 1) / d
+}
+fn storage_ro(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+fn storage_rw(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+fn uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+fn bind_ent(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: buf.as_entire_binding(),
+    }
+}
+
+// ---------- shaders ----------
+mod shaders {
+    pub fn vs() -> String {
+        r#"
 struct VsOut {
   @builtin(position) pos : vec4<f32>,
   @location(0) vel : vec2<f32>,
 };
-
 @vertex
 fn vs_main(@location(0) pos: vec2<f32>, @location(1) vel: vec2<f32>) -> VsOut {
   var out: VsOut;
@@ -130,72 +496,67 @@ fn vs_main(@location(0) pos: vec2<f32>, @location(1) vel: vec2<f32>) -> VsOut {
   out.vel = vel;
   return out;
 }
-"#;
-
-    let fs_src = r#"
-@fragment
-fn fs_main(@location(0) vel: vec2<f32>) -> @location(0) vec4<f32> {
-    let speed = length(vel) * 300.0;   // scale for visibility
-    let t = clamp(speed, 0.0, 1.0);
-
-    // colormap: black → blue → cyan → green → yellow → red → white
-    var r: f32;
-    var g: f32;
-    var b: f32;
-
-    if (t < 0.2) {
-        r = 0.0;
-        g = 0.0;
-        b = t / 0.2;
-    } else if (t < 0.4) {
-        r = 0.0;
-        g = (t - 0.2) / 0.2;
-        b = 1.0;
-    } else if (t < 0.6) {
-        r = (t - 0.4) / 0.2;
-        g = 1.0;
-        b = 1.0 - (t - 0.4) / 0.2;
-    } else if (t < 0.8) {
-        r = 1.0;
-        g = 1.0 - (t - 0.6) / 0.2;
-        b = 0.0;
-    } else {
-        r = 1.0;
-        g = (t - 0.8) / 0.2;
-        b = (t - 0.8) / 0.2;
+"#
+        .into()
     }
 
+    pub fn fs() -> String {
+        r#"
+@fragment
+fn fs_main(@location(0) vel: vec2<f32>) -> @location(0) vec4<f32> {
+    let speed = length(vel) * 300.0;
+    let t = clamp(speed, 0.0, 1.0);
+    var r: f32; var g: f32; var b: f32;
+    if (t < 0.2) {
+        r = 0.0; g = 0.0; b = t / 0.2;
+    } else if (t < 0.4) {
+        r = 0.0; g = (t - 0.2) / 0.2; b = 1.0;
+    } else if (t < 0.6) {
+        r = (t - 0.4) / 0.2; g = 1.0; b = 1.0 - (t - 0.4) / 0.2;
+    } else if (t < 0.8) {
+        r = 1.0; g = 1.0 - (t - 0.6) / 0.2; b = 0.0;
+    } else {
+        r = 1.0; g = (t - 0.8) / 0.2; b = (t - 0.8) / 0.2;
+    }
     return vec4<f32>(r, g, b, 0.8);
 }
-"#;
+"#
+        .into()
+    }
 
-    let cs_clear_src = format!(
-        r#"
-const GRID_SIZE : u32 = {gs}u;
-const NUM_CELLS : u32 = 4096u;
-
+    pub fn cs_clear(grid: u32) -> String {
+        format!(
+            r#"
+const GRID_SIZE : u32 = {grid}u;
 struct Counts {{ data: array<atomic<u32>> }};
-
 @group(0) @binding(0) var<storage, read_write> grid_counts : Counts;
 
 @compute @workgroup_size(256)
 fn clear_main(@builtin(global_invocation_id) id : vec3<u32>) {{
+  let num_cells = GRID_SIZE * GRID_SIZE;
   let i = id.x;
-  if (i < NUM_CELLS) {{
+  if (i < num_cells) {{
     atomicStore(&grid_counts.data[i], 0u);
   }}
 }}
-"#,
-        gs = GRID_SIZE
-    );
+"#
+        )
+    }
 
-    let cs_build_src = format!(
-        r#"
-const GRID_SIZE    : u32 = {gs}u;
-const NUM_CELLS    : u32 = 4096u;
+    pub fn cs_build(grid: u32, max_per_cell: u32) -> String {
+        format!(
+            r#"
+const GRID_SIZE    : u32 = {grid}u;
 const MAX_PER_CELL : u32 = {mpc}u;
 
-struct Particles {{ data: array<vec4<f32>> }};
+struct Particle {{
+  pos    : vec2<f32>,
+  vel    : vec2<f32>,
+  mass   : f32,
+  prefix : u32,
+  pad    : u32,
+}};
+struct Particles {{ data: array<Particle> }};
 struct Counts    {{ data: array<atomic<u32>> }};
 struct Grid      {{ data: array<u32> }};
 
@@ -215,8 +576,7 @@ fn cell_index(pos : vec2<f32>) -> u32 {{
 fn build_main(@builtin(global_invocation_id) id : vec3<u32>) {{
     let i = id.x;
     if (i >= arrayLength(&particles.data)) {{ return; }}
-    let pos = particles.data[i].xy;
-
+    let pos = particles.data[i].pos;
     let ci = cell_index(pos);
     let offset = atomicAdd(&grid_counts.data[ci], 1u);
     if (offset < MAX_PER_CELL) {{
@@ -225,30 +585,37 @@ fn build_main(@builtin(global_invocation_id) id : vec3<u32>) {{
     }}
 }}
 "#,
-        gs = GRID_SIZE,
-        mpc = MAX_PER_CELL
-    );
+            mpc = max_per_cell
+        )
+    }
 
-    let cs_interact_src = format!(
-        r#"
-const GRID_SIZE    : u32 = {gs}u;
-const NUM_CELLS    : u32 = 4096u;
+    pub fn cs_interact(grid: u32, max_per_cell: u32) -> String {
+        format!(
+            r#"
+const GRID_SIZE    : u32 = {grid}u;
 const MAX_PER_CELL : u32 = {mpc}u;
 
-const RADIUS2   : f32 = 0.003;
-const STRENGTH  : f32 = 0.00001;
-const DAMPING   : f32 = 0.99;
-const DT        : f32 = 1.0;
-const EPS       : f32 = 1e-6;
+const EPS     : f32 = 1e-6;
 
-struct Particles {{ data: array<vec4<f32>> }};
+struct Particle {{
+  pos    : vec2<f32>,
+  vel    : vec2<f32>,
+  mass   : f32,
+  prefix : u32,
+  pad    : u32,
+}};
+struct Particles {{ data: array<Particle> }};
 struct Counts    {{ data: array<atomic<u32>> }};
 struct Grid      {{ data: array<u32> }};
 
 struct Params {{
   mouse    : vec2<f32>,
-  radius2  : f32,
-  strength : f32,
+  mouse_radius2  : f32,
+  mouse_strength : f32,
+  force_radius2  : f32,
+  force_strength : f32,
+  particle_damping : f32,
+  dt: f32,
 }};
 
 @group(0) @binding(0) var<storage, read>       in_particles  : Particles;
@@ -274,23 +641,19 @@ fn interact_main(@builtin(global_invocation_id) id : vec3<u32>) {{
     let i = id.x;
     if (i >= arrayLength(&in_particles.data)) {{ return; }}
 
-    var p = in_particles.data[i];
-    var pos = p.xy;
-    var vel = p.zw;
+    var pos = in_particles.data[i].pos;
+    var vel = in_particles.data[i].vel;
+    let mass = in_particles.data[i].mass;
 
-    // let dm   = pos - params.mouse; // repulsion
-    let dm  = params.mouse - pos;   // attraction
-
-    let d2m  = dot(dm, dm);
-    if (d2m < params.radius2) {{
+    let dm  = pos - params.mouse;       // repulsion
+    let d2m = dot(dm, dm);
+    if (d2m < params.mouse_radius2) {{
         let inv = inverseSqrt(d2m + EPS);
         let dir = dm * inv;
-        vel += params.strength * dir;
+        vel += params.mouse_strength * dir;
     }}
 
     let gc = grid_coord(pos);
-
-    // neighbor repulsion in 3x3 cells
     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {{
         for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {{
             let nx = i32(gc.x) + dx;
@@ -301,444 +664,29 @@ fn interact_main(@builtin(global_invocation_id) id : vec3<u32>) {{
             for (var j: u32 = 0u; j < count && j < MAX_PER_CELL; j = j + 1u) {{
                 let pid = grid_indices.data[ci * MAX_PER_CELL + j];
                 if (pid == i) {{ continue; }}
-                let q = in_particles.data[pid];
-                let d = q.xy - pos;
+                let q_pos = in_particles.data[pid].pos;
+                let q_mass = in_particles.data[pid].mass;
+                let d = q_pos - pos;
                 let r2 = dot(d, d);
-                if (r2 > EPS && r2 < RADIUS2) {{
+                if (r2 > EPS && r2 < params.force_radius2) {{
                     let inv_r = inverseSqrt(r2);
-                    let dir = d * inv_r;
-                    vel -= STRENGTH * dir;
+                    vel -= params.force_strength * d * inv_r * inv_r * inv_r * params.dt * q_mass;
                 }}
             }}
         }}
     }}
 
-    vel *= DAMPING;
-    pos += vel * DT;
+    vel *= params.particle_damping;
+    pos += vel * params.dt;
 
     if (pos.x > 1.0 || pos.x < -1.0) {{ vel.x = -vel.x; }}
     if (pos.y > 1.0 || pos.y < -1.0) {{ vel.y = -vel.y; }}
 
-    out_particles.data[i] = vec4<f32>(pos, vel);
+    out_particles.data[i].pos = pos;
+    out_particles.data[i].vel = vel;
 }}
 "#,
-        gs = GRID_SIZE,
-        mpc = MAX_PER_CELL
-    );
-
-    // shader modules
-    let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("vs"),
-        source: wgpu::ShaderSource::Wgsl(vs_src.into()),
-    });
-    let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("fs"),
-        source: wgpu::ShaderSource::Wgsl(fs_src.into()),
-    });
-    let cs_clear = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("cs_clear"),
-        source: wgpu::ShaderSource::Wgsl(cs_clear_src.into()),
-    });
-    let cs_build = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("cs_build"),
-        source: wgpu::ShaderSource::Wgsl(cs_build_src.into()),
-    });
-    let cs_interact = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("cs_interact"),
-        source: wgpu::ShaderSource::Wgsl(cs_interact_src.into()),
-    });
-
-    // render pipeline
-    let render_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("render layout"),
-        bind_group_layouts: &[],
-        push_constant_ranges: &[],
-    });
-    let particle_as_vertex = wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<Particle>() as u64,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &wgpu::vertex_attr_array![
-            0 => Float32x2, // pos
-            1 => Float32x2  // vel
-        ],
-    };
-    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("render pipeline"),
-        layout: Some(&render_pl_layout),
-        vertex: wgpu::VertexState {
-            module: &vs,
-            entry_point: "vs_main",
-            buffers: &[particle_as_vertex],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &fs,
-            entry_point: "fs_main",
-            targets: &[Some(wgpu::ColorTargetState {
-                format: Frame::TEXTURE_FORMAT,
-                // blend: Some(wgpu::BlendState::REPLACE),
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::PointList,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-    });
-
-    // compute layouts and pipelines
-    // clear
-    let clear_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("clear bgl"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
-    let clear_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("clear layout"),
-        bind_group_layouts: &[&clear_bgl],
-        push_constant_ranges: &[],
-    });
-    let clear_counts_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("clear pipeline"),
-        layout: Some(&clear_pl_layout),
-        module: &cs_clear,
-        entry_point: "clear_main",
-    });
-    let clear_counts_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("clear bg"),
-        layout: &clear_bgl,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: grid_counts.as_entire_binding(),
-        }],
-    });
-
-    // build
-    let build_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("build bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-    let build_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("build layout"),
-        bind_group_layouts: &[&build_bgl],
-        push_constant_ranges: &[],
-    });
-    let build_grid_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("build pipeline"),
-        layout: Some(&build_pl_layout),
-        module: &cs_build,
-        entry_point: "build_main",
-    });
-    let build_bg_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("build A"),
-        layout: &build_bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buf_a.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: grid_counts.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: grid_indices.as_entire_binding(),
-            },
-        ],
-    });
-    let build_bg_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("build B"),
-        layout: &build_bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buf_b.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: grid_counts.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: grid_indices.as_entire_binding(),
-            },
-        ],
-    });
-
-    // params (group 1)
-    let params_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("params bgl"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
-    let params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("params bg"),
-        layout: &params_bgl,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: params_buf.as_entire_binding(),
-        }],
-    });
-
-    // interact
-    let interact_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("interact bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-    let interact_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("interact layout"),
-        bind_group_layouts: &[&interact_bgl, &params_bgl], // group(0)=data, group(1)=params
-        push_constant_ranges: &[],
-    });
-    let interact_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("interact pipeline"),
-        layout: Some(&interact_pl_layout),
-        module: &cs_interact,
-        entry_point: "interact_main",
-    });
-    let interact_bg_a2b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("interact A->B"),
-        layout: &interact_bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buf_a.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: buf_b.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: grid_counts.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: grid_indices.as_entire_binding(),
-            },
-        ],
-    });
-    let interact_bg_b2a = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("interact B->A"),
-        layout: &interact_bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buf_b.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: buf_a.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: grid_counts.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: grid_indices.as_entire_binding(),
-            },
-        ],
-    });
-
-    Model {
-        render_pipeline,
-        clear_counts_pipeline,
-        build_grid_pipeline,
-        interact_pipeline,
-        buf_a,
-        buf_b,
-        source_is_a: true,
-        grid_counts,
-        grid_indices,
-        clear_counts_bg,
-        build_bg_a,
-        build_bg_b,
-        interact_bg_a2b,
-        interact_bg_b2a,
-        params_buf,
-        params_bg,
-    }
-}
-
-fn update(app: &App, m: &mut Model, _u: Update) {
-    m.source_is_a = !m.source_is_a;
-
-    // mouse → NDC
-    let win = app.main_window().rect();
-    let mp = app.mouse.position();
-    let ndc_x = (mp.x / (win.w() * 0.5)) as f32;
-    let ndc_y = (mp.y / (win.h() * 0.5)) as f32;
-
-    let params = Params {
-        mouse: [ndc_x.clamp(-1.0, 1.0), ndc_y.clamp(-1.0, 1.0)],
-        radius2: 0.05,    // tweak at runtime if you like
-        strength: 0.001, // tweak
-    };
-    let window = app.main_window();
-    let queue = window.queue();
-    queue.write_buffer(&m.params_buf, 0, bytemuck::bytes_of(&params));
-}
-
-fn view(app: &App, m: &Model, frame: Frame) {
-    // CPU fade layer
-    let draw = app.draw();
-    draw.rect()
-        .wh(app.window_rect().wh())
-        .rgba(0.0, 0.0, 0.0, 0.03);
-    draw.to_frame(app, &frame).unwrap();
-
-    let mut enc = frame.command_encoder();
-
-    // choose groups
-    let (build_bg, interact_bg, render_buf) = if m.source_is_a {
-        (&m.build_bg_a, &m.interact_bg_a2b, &m.buf_b)
-    } else {
-        (&m.build_bg_b, &m.interact_bg_b2a, &m.buf_a)
-    };
-
-    // clear
-    {
-        let mut c = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("clear_counts"),
-        });
-        c.set_pipeline(&m.clear_counts_pipeline);
-        c.set_bind_group(0, &m.clear_counts_bg, &[]);
-        let groups = (NUM_CELLS + 255) / 256;
-        c.dispatch_workgroups(groups, 1, 1);
-    }
-
-    // build grid
-    {
-        let mut c = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("build_grid"),
-        });
-        c.set_pipeline(&m.build_grid_pipeline);
-        c.set_bind_group(0, build_bg, &[]);
-        let groups = ((N_PARTICLES as u32) + 255) / 256;
-        c.dispatch_workgroups(groups, 1, 1);
-    }
-
-    // interact + mouse repel
-    {
-        let mut c = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("interact"),
-        });
-        c.set_pipeline(&m.interact_pipeline);
-        c.set_bind_group(0, interact_bg, &[]);
-        c.set_bind_group(1, &m.params_bg, &[]); // mouse params
-        let groups = ((N_PARTICLES as u32) + 255) / 256;
-        c.dispatch_workgroups(groups, 1, 1);
-    }
-
-    // render
-    {
-        let mut r = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("render"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: frame.texture_view(),
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: true,
-                },
-            })],
-            depth_stencil_attachment: None,
-        });
-        r.set_pipeline(&m.render_pipeline);
-        r.set_vertex_buffer(0, render_buf.slice(..));
-        r.draw(0..N_PARTICLES as u32, 0..1);
+            mpc = max_per_cell
+        )
     }
 }
